@@ -12,6 +12,9 @@ class Confidence(PlanBase):
     @torch.no_grad
     def cal_utility(self, gaussian_map, voxel_map, candidates, simulator):
         t_utility = 0
+        # The planner renders candidates at reduced resolution because this
+        # utility is evaluated many times online; the paper emphasizes the
+        # speed advantage of using explicit Gaussian rendering here.
         render_resolution = np.round(self.render_ratio * simulator.resolution).astype(
             int
         )
@@ -66,7 +69,8 @@ class Confidence(PlanBase):
                 valid_mask = torch.ones(*render_resolution).bool()
                 t_simulator = 0
 
-            # exploration utility
+            # Paper Eq. (9), exploration term: reward views that expose a large
+            # amount of currently unexplored free-space voxels.
             depth_voxel = depths.clone()
             depth_voxel[depth_voxel < 0.001] = 10000  # unseen surfaces
             depth_voxel = torch.clamp(
@@ -85,7 +89,10 @@ class Confidence(PlanBase):
                 voxel_map.voxel_centers
             )
 
-            # exploitation utility
+            # Paper Eq. (9), exploitation term: reward views that are expected
+            # to observe low-confidence Gaussians. The implementation uses a
+            # depth-aware uncertainty average, which is slightly more specific
+            # than the high-level paper description.
             outrange_mask = depths > depth_range[1]
             confidences[outrange_mask] = 1.0
             confidences[~valid_mask] = 1.0
@@ -105,5 +112,8 @@ class Confidence(PlanBase):
         exploit_util[torch.isnan(exploit_util)] = 0.0
         explore_util[torch.isnan(explore_util)] = 0.0
 
+        # Eq. (9): combine exploration and exploitation; the large
+        # explore_weight keeps frontier expansion dominant and uses confidence
+        # mainly to refine surfaces once multiple views are available.
         utility = self.explore_weight * explore_util.cpu() + exploit_util.cpu()
         return utility, t_utility

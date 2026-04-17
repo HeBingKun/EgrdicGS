@@ -18,14 +18,19 @@ class GaussianMap:
     def __init__(self, cfg, device):
         self.device = device
 
-        # trainable gaussian parameters
+        # Trainable Gaussian parameters.
+        # These are the explicit scene state optimized online after each new
+        # keyframe, which is what makes ActiveGS different from voxel-only
+        # active mapping systems.
         self._means = torch.empty(0, device=device)
         self._scales = torch.empty(0, device=device)
         self._rotations = torch.empty(0, device=device)
         self._opacities = torch.empty(0, device=device)
         self._harmonics = torch.empty(0, device=device)
 
-        # non-trainable gaussian parameters for confidence
+        # Non-trainable statistics for the paper's per-Gaussian confidence.
+        # They summarize how often, from which directions and at what quality a
+        # Gaussian has been observed, and are later consumed by the planner.
         self.view_scores = torch.empty(0, device=device)
         self.view_supports = torch.empty(0, device=device)
         self.view_means = torch.empty((0, 3), device=self.device)
@@ -41,7 +46,6 @@ class GaussianMap:
             self.cfg = cfg
             self.use_view_distribution = cfg.use_view_distribution
             self.scene_near, self.scene_far = cfg.bound
-            self.sparse_ratio = cfg.sparse_ratio
             self.scale_factor = cfg.scale_factor
             self.error_thres = cfg.error_thres
             self.prune_interval = cfg.prune_interval
@@ -50,7 +54,10 @@ class GaussianMap:
                 cfg.background, dtype=torch.float32
             ).to(self.device)
 
-        # activation function
+        # Internal parameterization:
+        # - scales are optimized in log-space, then exponentiated
+        # - opacities are optimized in logit-space, then squashed by sigmoid
+        # - rotations are normalized quaternions
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
 
@@ -60,6 +67,8 @@ class GaussianMap:
         self.rotation_activation = torch.nn.functional.normalize
 
     def update(self, dataframe):
+        # Sec. III-B: each incoming keyframe first spawns new Gaussian surfels
+        # in under-explained regions, then runs a short online optimization.
         self.add_gaussians(dataframe)
         self.train()
 
@@ -70,6 +79,9 @@ class GaussianMap:
 
         torch.cuda.empty_cache()
         self.init_training()
+        # The weighted replay buffer is the code counterpart of the paper's
+        # online incremental optimization: always keep recent keyframes active,
+        # and revisit older frames that still have high rendering error.
         training_sampler = self.get_sampler(self.training_data)
         iterations = self.optimization_steps if steps is None else steps
 
@@ -116,6 +128,9 @@ class GaussianMap:
             consistency_loss = cons_loss_fc(normal_preds, d2n_preds)
             consistency_loss = (consistency_loss * mask_vis.long()).mean()
 
+            # Paper Eq. (5): RGB reconstruction + depth reconstruction + normal
+            # consistency. The code adds the edge-aware normal TV term as a
+            # stabilizer, which is an implementation detail beyond the paper.
             total_loss = (
                 rgb_loss
                 + 0.8 * depth_loss
@@ -134,6 +149,9 @@ class GaussianMap:
         track rendering performance at all keyframes
         """
 
+        # This error history is not just for logging: it directly controls the
+        # weighted replay sampler, so poorly reconstructed views stay in the
+        # online optimization loop longer.
         rgb_errs = torch.mean(rgb_loss, dim=[1, 2, 3])
         depth_errs = torch.mean(depth_loss, dim=[1, 2, 3])
         self.training_performance[frame_ids] = rgb_errs.detach() + depth_errs.detach()
@@ -191,12 +209,16 @@ class GaussianMap:
             render_masks=(depth_gts > 0.0).float(),
         ).render_view_all(require_importance=True, front_only=True)
 
-        # update visible gaussian info
+        # Paper Eq. (6)-(8): confidence is updated only for Gaussians that are
+        # visible in the latest keyframe; full-view aggregation is only used
+        # periodically for pruning to keep online runtime bounded.
         update_mask = counts[-1] >= 1.0  # visible gaussians for the latest view
         self.view_supports += update_mask.float()  # total visible views for a gaussian
 
         if self.use_view_distribution:
-            # update confidence
+            # Eq. (6)-(8): maintain an online estimate of view-direction coverage
+            # and accumulate a quality score that prefers close, front-facing
+            # observations of each Gaussian.
             gaussian_means = self.get_means.detach()
             gaussian_normals = self.get_normals.detach()
             view_directions = extrinsics[-1:, :3, 3] - gaussian_means
@@ -232,6 +254,9 @@ class GaussianMap:
             self.prune(~vis_mask)
 
     def prune(self, prune_mask):
+        # Pruning keeps the explicit GS representation compact. In ActiveGS,
+        # map growth mainly comes from spawning on new observations, so periodic
+        # visibility- and opacity-based cleanup is the main counterbalance.
         prune_mask += self.get_opacities < 0.1
         prune_mask = prune_mask.bool()
         self._means = self._means[~prune_mask]
@@ -257,6 +282,9 @@ class GaussianMap:
         return sampler
 
     def init_training(self):
+        # The optimizer groups mirror the paper's online setting: geometry,
+        # appearance and opacity are updated jointly, but with different lrs
+        # so newly spawned Gaussians can stabilize quickly.
         self._means = nn.Parameter(self._means)
         self._scales = nn.Parameter(self._scales)
         self._rotations = nn.Parameter(self._rotations)
@@ -294,6 +322,8 @@ class GaussianMap:
     def add_gaussians(self, dataframe):
         rgb = dataframe["rgb"]
         depth = dataframe["depth"]
+        # Depth smoothing reduces high-frequency sensor noise before normal
+        # estimation; the spawned Gaussian orientation is very sensitive to this.
         depth_smooth = get_smooth_depth(depth.squeeze(0).cpu().numpy())
         depth_smooth = torch.tensor(depth_smooth, device=self.device).unsqueeze(0)
         intrinsic = dataframe["intrinsic"]
@@ -305,14 +335,15 @@ class GaussianMap:
         xy_ray, _ = sample_image_grid((H, W), device=self.device)
         xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
         origins, directions = get_world_rays(xy_ray, extrinsic, intrinsic)
+        # Paper Eq. (2): initialize Gaussian means from the depth back-projected
+        # point cloud of the new keyframe.
         pcd = (origins + directions * depth.view(-1, 1, 1)).squeeze(1)  # (H*W, 3)
 
         pcd_normals = torch.zeros(point_num, 3, device=self.device)
         pcd_normals[:, 2] = 1.0
-        pcd_normals_cam = torch.zeros(point_num, 3, device=self.device)
-        pcd_normals_cam[:, 2] = 1.0
 
-        # use depth map to generate normal
+        # Paper Eq. (2): estimate surfel orientation from depth normals so the
+        # spawned primitive starts as a surface-aligned Gaussian.
         normals_cam = (
             depth2normal(
                 depth_smooth, valid_mask.view(1, H, W), fov=(np.pi / 3, np.pi / 3)
@@ -324,10 +355,10 @@ class GaussianMap:
         valid_mask *= valid_normal_mask
 
         normals_world = torch.matmul(extrinsic[:3, :3], normals_cam.T).T
-        pcd_normals_cam[valid_mask] = normals_cam[valid_mask]
         pcd_normals[valid_mask] = normals_world[valid_mask]
 
-        # remove normals that are non-visible
+        # Keep only front-facing surface normals; this avoids initializing
+        # Gaussians with orientations inconsistent with the current viewpoint.
         directions_norm = torch.nn.functional.normalize(
             directions.squeeze(1), dim=1
         )  # N, 3
@@ -336,6 +367,8 @@ class GaussianMap:
         valid_mask *= valid_normal_mask
 
         if self.is_init:
+            # Before spawning new Gaussians, render the current map from the
+            # incoming view and only densify where the map still fails.
             (
                 rgb_pred,
                 depth_pred,
@@ -367,15 +400,23 @@ class GaussianMap:
         else:
             global_render_results = None
 
+        # Paper Eq. (2) and Eq. (3): initialize mean / rotation / scale /
+        # opacity / color from the newly observed surface sample. The tiny
+        # third-axis scale makes each primitive behave like a thin surfel.
         means_new = pcd
         rotations_new, _ = normal2rotation(pcd_normals)
         scales_new = torch.zeros_like(means_new, device=self.device)
+        # The z-axis scale starts almost degenerate so each primitive behaves as
+        # a thin surface element rather than a volumetric blob.
         scales_new[:, -1] -= 1e10
         opacities_new = torch.zeros(point_num, device=self.device)
+        # Only degree-0 color is used here; this repository treats harmonics as
+        # precomputed per-Gaussian RGB rather than higher-order view-dependent SH.
         harmonics_new = torch.zeros(point_num, 1, 3, device=self.device)
         harmonics_new[:, 0, :] = rgb.permute(1, 2, 0).view(-1, 3)
 
-        # non-learnable parameters
+        # These statistics are not optimized by backprop; they are the paper's
+        # confidence state used later for exploitation-aware planning.
         view_scores_new = torch.zeros(point_num, device=self.device)
         view_supports_new = torch.zeros(point_num, device=self.device)
         view_means_new = torch.zeros((point_num, 3), device=self.device)
@@ -397,7 +438,8 @@ class GaussianMap:
         select_mask = select_mask.to(self.device).squeeze(0) * valid_mask
         selected_idx = torch.nonzero(select_mask, as_tuple=False).flatten()
 
-        # voxel filtering
+        # Extra engineering guardrail: voxel downsampling keeps the online map
+        # compact, while the paper mainly describes the spawn criterion itself.
         select_mask_final = torch.zeros_like(select_mask, dtype=torch.bool)
         test_mask = torch.zeros(len(selected_idx), dtype=torch.bool)
         selected_pcd = pcd[select_mask]
@@ -479,6 +521,12 @@ class GaussianMap:
             depth = pred["depth"].to(device)
             opacity = pred["opacity"].to(device)
 
+            # Paper Eq. (4): spawn Gaussians in regions the current map cannot
+            # explain well. The code follows the same idea with three tests:
+            # large RGB error, low opacity coverage, or predicted depth that
+            # falls behind the observed front surface. The RGB term is
+            # implemented as squared error rather than the paper's prose-level
+            # notation, which is a practical implementation choice.
             rgb_error = torch.mean((rgb_gt - rgb) ** 2, dim=1)
             mask = rgb_error > self.error_thres
             mask += opacity < 0.5
@@ -536,6 +584,8 @@ class GaussianMap:
 
     @property
     def get_scales(self):
+        # Convert the optimized log-scale to metric Gaussian radii and clamp it
+        # to prevent unstable oversized splats during online updates.
         return torch.clamp(
             self.scale_factor * self.scaling_activation(self._scales), min=0, max=0.05
         )
@@ -551,6 +601,8 @@ class GaussianMap:
     @property
     def get_confidences(self):
         if self.use_view_distribution:
+            # Paper Eq. (8): confidence is the accumulated observation quality
+            # modulated by how uniformly the Gaussian has been viewed.
             view_var = self.view_means.norm(dim=-1)
             view_var[torch.isnan(view_var)] = 1.0
             view_variance_factor = torch.exp(1 - view_var)
@@ -558,6 +610,7 @@ class GaussianMap:
                 view_variance_factor * self.view_scores, min=0, max=1
             )
         else:
+            # Ablation fallback: confidence from observation count only.
             confidences = torch.clamp(
                 1 - 1 / torch.exp(self.view_supports), min=0, max=1
             )
@@ -566,6 +619,9 @@ class GaussianMap:
 
     @property
     def get_normals(self):
+        # The third column of the rotation matrix is treated as the surfel
+        # normal, which is exactly the orientation cue reused by the planner
+        # when it builds low-confidence ROI voxels.
         return self.rotation_activation(
             quaternion_to_matrix(self.get_rotations)[:, :3, 2]
         )

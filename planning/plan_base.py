@@ -49,6 +49,9 @@ class PlanBase:
 
             ##### view candidate sampling
             if self.max_roi_sample_num > 0:
+                # Paper Sec. III-D/III-E: ROI combines frontier voxels and
+                # low-confidence Gaussian regions so planning balances
+                # exploration with quality refinement.
                 voxel_map.update_utility(gaussian_map, self.use_confidence)
                 roi_candidates = self.generate_roi_candidates(
                     voxel_map, self.max_roi_sample_num
@@ -73,6 +76,8 @@ class PlanBase:
             )
 
             ##### utility calculation
+            # Paper Eq. (9): evaluate each candidate with an exploration term
+            # and, for ActiveGS, an exploitation term from Gaussian confidence.
             utility_list, t_utility = self.cal_utility(
                 gaussian_map, voxel_map, total_candidates, simulator
             )
@@ -88,6 +93,8 @@ class PlanBase:
             t_planning += time.time() - t_path_start
 
             ##### nbv selection
+            # Paper Eq. (10): final NBV score trades information gain against
+            # travel cost on the voxel A* graph.
             score_list = self.cal_view_scores(utility_list, wp_length_list)
             nbv_id = torch.argmax(score_list)
             if nbv_id < len(roi_candidates):
@@ -133,6 +140,8 @@ class PlanBase:
         generate random view candidates around current pose
         """
 
+        # Random candidates keep a non-zero exploration prior even when ROI
+        # sampling is biased toward already discovered but uncertain regions.
         voxel_centers = voxel_map.voxel_centers.cpu().numpy()
         free_mask = voxel_map.free_mask_w_margin.cpu().numpy()
 
@@ -154,6 +163,9 @@ class PlanBase:
         generate targeted view candidates arount ROI
         """
 
+        # ROI-guided candidate generation is the paper's efficiency lever:
+        # instead of scoring all reachable views, only sample around frontier
+        # and low-confidence regions and orient each candidate toward the ROI.
         roi_candiates = torch.tensor([])
         sample_per_roi = 5
         free_mask = voxel_map.free_mask_w_margin
@@ -229,6 +241,7 @@ class PlanBase:
         if torch.all(view_utilities == 0):
             view_scores = torch.rand_like(view_utilities)
         else:
+            # Eq. (10): utility minus weighted travel cost after normalization.
             view_scores = view_utilities - self.path_length_factor * path_lengths
         return view_scores
 

@@ -733,6 +733,9 @@ class GaussianRenderer:
         render_masks=None,
     ):
         self.device = device
+        # This renderer is the shared forward model for the whole paper:
+        # training, active utility evaluation and final evaluation all call the
+        # same Gaussian rasterization path.
         (
             self.gaussian_means,
             self.gaussian_harmonics,
@@ -753,6 +756,8 @@ class GaussianRenderer:
         far = repeat(
             torch.tensor(near_far[1], device=self.device), "-> b", b=self.batch_size
         )
+        # Paper Eq. (1)-(3): project 3D Gaussian primitives into the current
+        # camera and rasterize them to RGB/depth/normal/confidence images.
         fov_x, fov_y = get_fov(intrinsics).unbind(dim=-1)
         self.fovs = torch.stack([fov_x, fov_y], dim=-1)
         projection_matrices_cam = get_projection_matrix(near, far, fov_x, fov_y)
@@ -791,6 +796,7 @@ class GaussianRenderer:
     def render_view(
         self, i=0, require_grad=False, require_importance=False, front_only=False
     ):
+        # Single-view forward pass used by the planner for candidate scoring.
         with torch.set_grad_enabled(require_grad):
             (rgb, depth, normal, opacity, d2n, confidence, importance, count, radii) = (
                 render_cuda_core(
@@ -829,6 +835,8 @@ class GaussianRenderer:
     def render_view_all(
         self, require_grad=False, require_importance=False, front_only=False
     ):
+        # Batched forward pass used by the mapper during online optimization and
+        # by eval.py during rendering-quality evaluation.
         num_gaussians = len(self.gaussian_means)
         all_rgbs = torch.empty(self.batch_size, 3, self.h, self.w, device=self.device)
         all_depths = torch.empty(self.batch_size, 1, self.h, self.w, device=self.device)

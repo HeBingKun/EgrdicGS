@@ -12,6 +12,11 @@ class VoxelMap:
     def __init__(self, cfg, bbox, device):
         self.device = device
         self.min_gaussian_per_voxel = cfg.min_gaussian_per_voxel
+        # The voxel map is the discrete half of the paper's dual-map design.
+        # It does not try to reconstruct appearance; instead it provides:
+        # 1) occupancy / free-space reasoning,
+        # 2) frontier extraction,
+        # 3) a sparse motion graph for A* planning.
         bbox = torch.tensor(bbox)
         extents = bbox[1] - bbox[0]
         map_resolution = torch.tensor(cfg.map_resolution)
@@ -52,6 +57,9 @@ class VoxelMap:
         self.planning_mask = torch.zeros(torch.prod(dim))
         self.roi_mask = torch.zeros(torch.prod(dim), dtype=torch.bool)
 
+        # The graph is built over free voxels, not Gaussians. This separation is
+        # exactly why ActiveGS can use rich Gaussian uncertainty without turning
+        # path planning itself into a continuous optimization problem.
         self.graph = VoxelGrpah(size.numpy(), dim.numpy(), self.voxel_indices.numpy())
 
         self.dim = dim
@@ -65,6 +73,8 @@ class VoxelMap:
         """
 
         self.voxel_normal = torch.zeros((torch.prod(self.dim), 3), device=self.device)
+        # Frontier voxels are the exploration ROI in the paper: free space
+        # adjacent to unexplored space.
         raw_roi_mask = self.frontier_mask
 
         if use_confidence:
@@ -80,7 +90,9 @@ class VoxelMap:
             gaussian_confidence = gaussian_confidence[valid_mask]
             gaussian_opacity = gaussian_opacity[valid_mask]
 
-            # get high-opacity low-confidence gaussians
+            # Paper Sec. III-D: low-confidence but already reconstructed
+            # regions become exploitation ROI. High opacity filters out weak or
+            # transient Gaussians before voting into voxels.
             confidence_mask = gaussian_confidence < confidence_thres
             confidence_mask *= gaussian_opacity > 0.7
 
@@ -105,7 +117,8 @@ class VoxelMap:
                 gaussian_normal,
             )
 
-            # add voxels with low-confidence gaussians to roi set
+            # These voxels complement frontier ROI so the planner can revisit
+            # surfaces that are visible but still geometrically uncertain.
             update_mask = voxel_sum > self.min_gaussian_per_voxel
             mean_normals = voxel_normal_sum / voxel_sum.unsqueeze(1)
             self.voxel_normal[update_mask] = torch.nn.functional.normalize(
@@ -120,6 +133,8 @@ class VoxelMap:
         update graph for path planning
         """
 
+        # The planning graph is the "can I move there safely?" component of the
+        # dual-map design. GaussianMap never answers this question directly.
         planning_mask = self.free_mask_w_margin + robot_space
         self.graph.update_graph(planning_mask.cpu().numpy())
 
@@ -162,7 +177,10 @@ class VoxelMap:
         frustum_hit_mask[x_indices, y_indices, z_indices] = True
         frustum_hit_mask = frustum_hit_mask.view(-1)
 
-        # remove occ voxel from free mask
+        # Occupancy update follows the classic hit/pass inverse sensor model:
+        # - hit voxels move toward occupied
+        # - traversed voxels move toward free
+        # This is what later supports frontier extraction for exploration.
         frustum_pass_mask &= ~frustum_hit_mask
         dist_pass = cal_distance(
             self.voxel_centers[frustum_pass_mask], extrinsic[:3, 3]
@@ -273,6 +291,8 @@ class VoxelMap:
         get mask for all visible voxels at given view with its depth
         """
 
+        # The planner uses this visibility query to turn a rendered candidate
+        # depth image into "which unexplored voxels would become visible?".
         points_2d, points_depth = self._project_3d_points(extrinsic, intrinsic)
         frustum_mask, _ = self._get_frustum_mask(points_2d, points_depth, depth)
         return frustum_mask
@@ -282,6 +302,8 @@ class VoxelMap:
         remove roi without free neighbors
         """
 
+        # ROI voxels without adjacent free space are not useful planning goals:
+        # they may be uncertain in the Gaussian map, but they are not reachable.
         dilated_free_mask = self._dilate_mask(
             self.free_mask.view(*self.dim).clone().cpu().numpy(),
             self.frontier_structure_element,
@@ -327,6 +349,8 @@ class VoxelMap:
 
     @property
     def free_mask_w_margin(self):
+        # Safety margin inflation is what turns raw free space into traversable
+        # space for the robot/camera platform.
         dilated_occ_mask = self._dilate_mask(
             self.occ_mask.view(*self.dim).clone().cpu().numpy(),
             self.occ_structure_element,
@@ -339,6 +363,9 @@ class VoxelMap:
 
     @property
     def frontier_mask(self):
+        # Frontier = free voxels next to unexplored voxels. This is the classic
+        # exploration target that the paper augments with low-confidence ROI
+        # from the Gaussian map.
         dilated_unexplored_mask = self._dilate_mask(
             self.unexplored_mask.view(*self.dim).clone().cpu().numpy(),
             self.frontier_structure_element,

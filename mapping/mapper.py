@@ -41,11 +41,21 @@ class IncrementalMapper:
 
     def init_map(self):
         print("\n ----------initialize map----------")
+        # Core "dual-map" design of the paper:
+        # - GaussianMap: continuous, differentiable scene representation used
+        #   for rendering, optimization and confidence estimation.
+        # - VoxelMap: discrete occupancy / frontier / traversability structure
+        #   used for ROI extraction and path planning.
+        # The planner needs both because "what is uncertain" lives in the GS,
+        # while "where can the robot go" lives in the voxel map.
         self.gaussian_map = GaussianMap(self.cfg.gaussian_map, self.device)
         self.voxel_map = VoxelMap(self.cfg.voxel_map, self.simulator.bbox, self.device)
 
     def get_new_dataframe(self, i):
-        # return way points to the nbv
+        # The planner returns the full camera path to the next-best-view (NBV).
+        # This is the outer loop described in Sec. III / Fig. 2 of the paper:
+        # planning proposes the next informative pose, mapping consumes only the
+        # terminal pose as the next keyframe for the GS and voxel map updates.
         path = self.planner.plan(self.current_map, self.simulator, self.recorder)
 
         # for visualization only
@@ -60,7 +70,8 @@ class IncrementalMapper:
                 )
                 time.sleep(0.05)
 
-        # dataframe at nbv as keyframe
+        # The last pose on the path is the actual acquisition viewpoint.
+        # All intermediate poses are only used for flight / GUI visualization.
         dataframe = self.simulator.simulate(path[-1])
         camera_frame = Camera.init_from_mapper(i, dataframe)
         self.q_mapper2gui.put(
@@ -90,6 +101,10 @@ class IncrementalMapper:
                 f"\n {TextColors.MAGENTA}----------Step {frame_id+1}----------{TextColors.RESET}"
             )
 
+            # ActiveGS alternates between:
+            # 1) planning from the current hybrid map and
+            # 2) incremental map update from the newly acquired RGB-D frame.
+            # This is the mission-level loop shown in Fig. 2.
             print(f"\n {TextColors.GREEN}-----Planning:{TextColors.RESET}")
             dataframe = self.get_new_dataframe(frame_id)
             dataframe = {k: v.to(self.device) for k, v in dataframe.items()}
@@ -97,10 +112,12 @@ class IncrementalMapper:
             print(f"\n {TextColors.GREEN}-----Mapping:{TextColors.RESET}")
             t_mapper_start = time.time()
 
-            # update gaussian map
+            # Update the GS map first because the planner's exploitation term
+            # (paper Sec. III-C/III-D) is defined on Gaussian confidence.
             self.gaussian_map.update(dataframe)
 
-            # update voxel map
+            # Update the voxel map for occupancy, frontier extraction and
+            # traversability. The planner uses this for exploration and A*.
             self.voxel_map.update(dataframe)
 
             t_mapper = time.time() - t_mapper_start
